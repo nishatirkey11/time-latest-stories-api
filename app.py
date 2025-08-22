@@ -1,96 +1,108 @@
-from flask import Flask, jsonify
-import requests
-from bs4 import BeautifulSoup
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.request
 import re
+import json
 from urllib.parse import urljoin
 
-#Configuration
+BASE_URL = "https://time.com"
 
-CONFIG = {
-    "BASE_URL": "https://time.com",
-    "STORIES_TO_FETCH": 6,
-    "REQUEST_TIMEOUT": 15,
-    "USER_AGENT": "Mozilla/5.0 (compatible; TimeLatestStoriesBot/1.0; +http://example.com/bot)"
-}
+# --- Step 1: Fetch HTML ---
+def fetch_html(url: str) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; TimeBot/1.0)"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.read().decode(charset, errors="replace")
 
-#Core Logic
+# --- Step 2: Parse HTML (basic regex) ---
+def parse_latest_stories(html_text: str, limit: int = 6):
+    """
+    Parse HTML using regex only (no external libs).
+    Extracts the first 6 article links under 'LATEST STORIES'.
+    """
+    stories = []
+    seen = set()
 
-def get_page_content(url):
-    
-    headers = {"User-Agent": CONFIG["USER_AGENT"]}
-    response = requests.get(url, headers=headers, timeout=CONFIG["REQUEST_TIMEOUT"])
-    response.raise_for_status()  
-    return response.text
+    # Regex to capture anchors
+    anchor_pattern = re.compile(
+        r'<a[^>]+href=["\'](?P<href>[^"\']+)["\'][^>]*>(?P<text>.*?)</a>',
+        re.IGNORECASE | re.DOTALL
+    )
 
-def extract_story_data(html_content):
-    
-    soup = BeautifulSoup(html_content, 'html.parser')
-    articles = []
-    processed_urls = set()
-    
-    
-    for link_tag in soup.find_all('a', href=True):
-        
-        title = link_tag.get_text(strip=True)
-        if not title:
+    # Article links look like: /6142934/...
+    article_pattern = re.compile(r"/\d{7,}/")
+
+    for match in anchor_pattern.finditer(html_text):
+        href = match.group("href")
+        text = match.group("text")
+
+        # Normalize href
+        if href.startswith("//"):
+            href = "https:" + href
+        elif href.startswith("/"):
+            href = urljoin(BASE_URL, href)
+
+        if not href.startswith(BASE_URL):
+            continue
+        if not article_pattern.search(href):
             continue
 
-        url = link_tag['href']
-        
-        
-        if url.startswith('/'):
-            url = urljoin(CONFIG["BASE_URL"], url)
-            
-        
-        is_story_link = (
-            url.startswith(CONFIG["BASE_URL"]) and 
-            re.search(r'/\d{7,}/', url) and 
-            url not in processed_urls
-        )
+        # Strip HTML tags from text
+        clean_title = re.sub(r"<[^>]*>", "", text, flags=re.DOTALL).strip()
+        clean_title = re.sub(r"\s+", " ", clean_title)
 
-        if is_story_link:
-            articles.append({'title': title, 'link': url})
-            processed_urls.add(url)
-            
-            
-            if len(articles) >= CONFIG["STORIES_TO_FETCH"]:
-                break
-                
-    return articles
+        if not clean_title:
+            continue
 
-#Flask Application Setup
+        if href not in seen:
+            stories.append({"title": clean_title, "link": href})
+            seen.add(href)
 
-app = Flask(__name__)
+        if len(stories) >= limit:
+            break
 
-@app.route('/getTimeStories', methods=['GET'])
-def stories_api_endpoint():
-    """API endpoint to fetch the latest stories."""
+    return stories
+
+# --- Step 3: API Handler ---
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/getTimeStories":
+            try:
+                html_text = fetch_html(BASE_URL)
+                stories = parse_latest_stories(html_text, limit=6)
+
+                if not stories:
+                    response = {"error": "No stories found"}
+                    self.send_response(502)
+                else:
+                    response = stories
+                    self.send_response(200)
+
+                payload = json.dumps(response, ensure_ascii=False).encode("utf-8")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            except Exception as e:
+                msg = {"error": f"Unexpected error: {e}"}
+                payload = json.dumps(msg).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not Found. Try /getTimeStories")
+
+# --- Step 4: Run server ---
+if __name__ == "__main__":
+    server = HTTPServer(("0.0.0.0", 8000), Handler)
+    print("Server running at http://localhost:8000/getTimeStories")
     try:
-        page_html = get_page_content(CONFIG["BASE_URL"])
-        latest_stories = extract_story_data(page_html)
-        
-        if not latest_stories:
-            error_message = "Could not find any stories. The website's structure may have changed."
-            return jsonify({"error": error_message}), 502 
-
-        return jsonify(latest_stories)
-
-    except requests.exceptions.RequestException as e:
-        
-        error_message = f"Error fetching data from Time.com: {e}"
-        return jsonify({"error": error_message}), 502
-        
-    except Exception as e:
-        
-        return jsonify({"error": f"An unexpected internal error occurred: {e}"}), 500
-
-@app.route('/', methods=['GET'])
-def index():
-    """Root endpoint to confirm the service is running."""
-    return "Service is active. Please use the /getTimeStories endpoint to get the latest articles."
-
-#Main Execution
-
-if __name__ == '__main__':
-    
-    app.run(host="0.0.0.0", port=5000, debug=True)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
