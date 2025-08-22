@@ -1,99 +1,96 @@
-from flask import Flask, jsonify, Response
-import urllib.request
-import urllib.error
-from urllib.parse import urljoin
+from flask import Flask, jsonify
+import requests
+from bs4 import BeautifulSoup
 import re
-import html
+from urllib.parse import urljoin
 
-app = Flask(__name__)
+#Configuration
 
-BASE_URL = "https://time.com"
+CONFIG = {
+    "BASE_URL": "https://time.com",
+    "STORIES_TO_FETCH": 6,
+    "REQUEST_TIMEOUT": 15,
+    "USER_AGENT": "Mozilla/5.0 (compatible; TimeLatestStoriesBot/1.0; +http://example.com/bot)"
+}
 
-def fetch_html(url: str) -> str:
+#Core Logic
+
+def get_page_content(url):
     
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; TimeLatestStoriesBot/1.0)"
-        },
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return resp.read().decode(charset, errors="replace")
+    headers = {"User-Agent": CONFIG["USER_AGENT"]}
+    response = requests.get(url, headers=headers, timeout=CONFIG["REQUEST_TIMEOUT"])
+    response.raise_for_status()  
+    return response.text
 
-
-def strip_tags(text: str) -> str:
-    no_tags = re.sub(r"<[^>]*>", "", text, flags=re.DOTALL)
-
-    return html.unescape(no_tags).strip()
-
-
-def parse_latest_stories(html_text: str, max_items: int = 6):
+def extract_story_data(html_content):
     
-    stories = []
-    seen_links = set()
-
+    soup = BeautifulSoup(html_content, 'html.parser')
+    articles = []
+    processed_urls = set()
     
-    anchor_pattern = re.compile(
-        r'<a[^>]+href=["\'](?P<href>[^"\']+)["\'][^>]*>(?P<text>.*?)</a>',
-        re.IGNORECASE | re.DOTALL,
-    )
-
-    article_id_pattern = re.compile(r"/\d{7,}/", re.IGNORECASE)
-
-    for m in anchor_pattern.finditer(html_text):
-        href = m.group("href")
-        text = m.group("text")
-
-        if href.startswith("//"):
-            href = "https:" + href
-        elif href.startswith("/"):
-            href = urljoin(BASE_URL, href)
-
-        if not href.startswith("https://time.com"):
-            continue
-        if not article_id_pattern.search(href):
-            continue
-
-        title = strip_tags(text)
+    
+    for link_tag in soup.find_all('a', href=True):
+        
+        title = link_tag.get_text(strip=True)
         if not title:
             continue
 
-        title = re.sub(r"\s+", " ", title).strip()
+        url = link_tag['href']
+        
+        
+        if url.startswith('/'):
+            url = urljoin(CONFIG["BASE_URL"], url)
+            
+        
+        is_story_link = (
+            url.startswith(CONFIG["BASE_URL"]) and 
+            re.search(r'/\d{7,}/', url) and 
+            url not in processed_urls
+        )
 
-        if href not in seen_links:
-            stories.append({"title": title, "link": href})
-            seen_links.add(href)
+        if is_story_link:
+            articles.append({'title': title, 'link': url})
+            processed_urls.add(url)
+            
+            
+            if len(articles) >= CONFIG["STORIES_TO_FETCH"]:
+                break
+                
+    return articles
 
-        if len(stories) >= max_items:
-            break
+#Flask Application Setup
 
-    return stories
+app = Flask(__name__)
 
-
-@app.get("/getTimeStories")
-def get_time_stories():
+@app.route('/getTimeStories', methods=['GET'])
+def stories_api_endpoint():
+    """API endpoint to fetch the latest stories."""
     try:
-        page_html = fetch_html(BASE_URL)
-        items = parse_latest_stories(page_html, max_items=6)
+        page_html = get_page_content(CONFIG["BASE_URL"])
+        latest_stories = extract_story_data(page_html)
+        
+        if not latest_stories:
+            error_message = "Could not find any stories. The website's structure may have changed."
+            return jsonify({"error": error_message}), 502 
 
-        if not items:
-            return jsonify({"error": "No stories found. Page structure may have changed."}), 502
+        return jsonify(latest_stories)
 
-        return jsonify(items)
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
-        return jsonify({"error": f"Failed to fetch Time.com: {e}"}), 502
+    except requests.exceptions.RequestException as e:
+        
+        error_message = f"Error fetching data from Time.com: {e}"
+        return jsonify({"error": error_message}), 502
+        
     except Exception as e:
-        return jsonify({"error": f"Unexpected error: {e}"}), 500
+        
+        return jsonify({"error": f"An unexpected internal error occurred: {e}"}), 500
 
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint to confirm the service is running."""
+    return "Service is active. Please use the /getTimeStories endpoint to get the latest articles."
 
-@app.get("/")
-def root():
-    return Response(
-        "OK. Use /getTimeStories to fetch latest 6 Time.com stories.",
-        mimetype="text/plain",
-    )
+#Main Execution
 
-
-if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+if __name__ == '__main__':
+    
+    app.run(host="0.0.0.0", port=5000, debug=True)
